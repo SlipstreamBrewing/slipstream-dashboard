@@ -314,11 +314,65 @@ const ADAPTERS = {
      Example (Deputy): pasted permanent token (secret ROSTERING_API_TOKEN).
   */
   rostering: {
-    configured: false,
-    auth: null,
+    configured: true,
+    auth: 'token',
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('rostering'); },
+    _base: 'https://my.tanda.co/api/v2',
+    _tokenSecret: 'ROSTERING_API_TOKEN',
+
+    _addDays(d, n) {
+      const t = new Date(d + 'T00:00:00Z'); t.setUTCDate(t.getUTCDate() + n);
+      return t.toISOString().slice(0, 10);
+    },
+    _daysBetween(a, b) {
+      return Math.round((new Date(b + 'T00:00:00Z') - new Date(a + 'T00:00:00Z')) / 86400000);
+    },
+    async _rosterOn(env, date) {
+      const token = env[this._tokenSecret];
+      const res = await fetch(this._base + '/rosters/on/' + date + '?show_costs=true', { headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' } });
+      if (res.status === 204) return null;
+      if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
+      return res.json();
+    },
+
+    async status(env, h) {
+      const token = env[this._tokenSecret];
+      if (!token) return { connected: false };
+      let org = null;
+      try {
+        const res = await fetch(this._base + '/organisations', { headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' } });
+        if (res.ok) { const o = await res.json(); if (Array.isArray(o) && o.length) org = o[0].name || null; }
+      } catch (e) { /* org label is best-effort */ }
+      return { connected: true, org: org || 'Tanda', sandbox: false, lastSync: null };
+    },
+
+    async fetchRange(env, h, q) {
+      const token = env[this._tokenSecret];
+      if (!token) { const e = new Error('no token'); e.status = 401; throw e; }
+      if (this._daysBetween(q.from, q.to) > 45) return { cost: null };
+      let cost = 0; const seen = new Set();
+      let cursor = q.from; let guard = 0; let any = false;
+      while (cursor <= q.to && guard < 12) {
+        guard++;
+        let roster;
+        try { roster = await this._rosterOn(env, cursor); }
+        catch (e) { if (e.status === 401 || e.status === 403) throw e; roster = null; }
+        if (!roster) { cursor = this._addDays(cursor, 7); continue; }
+        if (!seen.has(roster.id)) {
+          seen.add(roster.id); any = true;
+          for (const day of (roster.schedules || [])) {
+            if (day && day.date >= q.from && day.date <= q.to) {
+              for (const sh of (day.schedules || [])) {
+                if (typeof sh.cost === 'number' && isFinite(sh.cost)) cost += sh.cost;
+              }
+            }
+          }
+        }
+        cursor = this._addDays(roster.finish || cursor, 1);
+      }
+      return { cost: any ? cost : null };
+    },
+
     async fetchMonthly(env, h, q) { return { months: [], cost: [] }; }
   }
 };
@@ -331,7 +385,7 @@ class NotConfigured extends Error {
   constructor(source) { super('not configured: ' + source); this.source = source; }
 }
 
-const BUILD_TAG = 'diag-5';
+const BUILD_TAG = 'diag-6';
 const DIAG_KEY = 'diagk_7c1f9a2b4e55';
 
 const PLAIN_ERRORS = {
@@ -774,7 +828,7 @@ async function apiDiag(env, url) {
   if (url.searchParams.get('k') !== DIAG_KEY) return json({ error: 'no' }, 404);
   const out = { build: BUILD_TAG, ts: new Date().toISOString() };
   const h = makeHelpers(env, 'accounting');
-  out.env = { accId: (env.ACCOUNTING_CLIENT_ID || '').length, accSecret: (env.ACCOUNTING_CLIENT_SECRET || '').length, ingest: (env.INGEST_TOKEN || '').length };
+  out.env = { accId: (env.ACCOUNTING_CLIENT_ID || '').length, accSecret: (env.ACCOUNTING_CLIENT_SECRET || '').length, ingest: (env.INGEST_TOKEN || '').length, roster: (env.ROSTERING_API_TOKEN || '').length };
   if (url.searchParams.get('full') === '1') {
     const u = new URL(url.origin + '/api/metrics?cur=2026-06-01:2026-06-30&prev=2026-05-01:2026-05-31&yoy=2025-06-01:2025-06-30&trend=2025-07:2026-06&tz=Australia/Brisbane&refresh=1');
     const t0 = Date.now();
@@ -796,6 +850,11 @@ async function apiDiag(env, url) {
   try { const m = await ADAPTERS.accounting.fetchMonthly(env, h, { fromMonth: '2026-04', toMonth: '2026-06' }); out.monthlyOk = true; out.monthsN = (m.months || []).length; } catch (e) { out.monthlyOk = false; out.monthlyErr = { m: String(e && e.message), code: e && e.status }; }
   out.monthlyMs = Date.now() - s0;
   try { out.posLastSync = await lastSync(env, 'pos'); } catch (e) {}
+  const hr = makeHelpers(env, 'rostering');
+  try { out.rosStatus = await ADAPTERS.rostering.status(env, hr); } catch (e) { out.rosStatusErr = { m: String(e && e.message), code: e && e.status }; }
+  let sr = Date.now();
+  try { const rc = await ADAPTERS.rostering.fetchRange(env, hr, { from: '2026-06-23', to: '2026-06-29' }); out.rosCost = rc.cost; } catch (e) { out.rosErr = { m: String(e && e.message), code: e && e.status }; }
+  out.rosMs = Date.now() - sr;
   return json(out);
 }
 
