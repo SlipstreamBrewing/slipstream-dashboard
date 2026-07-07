@@ -218,12 +218,88 @@ const ADAPTERS = {
      connect.squareupsandbox.com.
   */
   pos: {
-    configured: false,
-    auth: null,
+    configured: true,
+    auth: 'export',
+    mode: 'export',
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('pos'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('pos'); }
+
+    _completed: ['CASH SALE', 'TABLE CLOSED', 'BISTRO CLOSED', 'PICKUP CLOSED', 'MONTHLY ACCOUNT'],
+    _months: { jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06', jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12' },
+
+    _splitCSV(line) {
+      const out = []; let cur = ''; let q = false;
+      for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (q) { if (ch === '"') { if (line[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += ch; }
+        else { if (ch === '"') q = true; else if (ch === ',') { out.push(cur); cur = ''; } else cur += ch; }
+      }
+      out.push(cur); return out;
+    },
+
+    _iso(s) {
+      s = String(s || '').trim();
+      let m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
+      if (m) return m[1] + '-' + m[2] + '-' + m[3];
+      m = /^(\d{1,2})-([A-Za-z]{3})-(\d{4})/.exec(s);
+      if (m) { const mo = this._months[m[2].toLowerCase()]; if (mo) return m[3] + '-' + mo + '-' + String(m[1]).padStart(2, '0'); }
+      return null;
+    },
+
+    /* Accepts either a compact summary (columns: date,count) or a BePoz
+       "Transaction List" line-item export. Counts one completed sale per
+       Trans. ID (Cash Sale + the Closed types + Monthly Account), excluding
+       refunds (negative Transaction Total) and all open/held/operational rows. */
+    async parseExport(env, h, raw) {
+      const text = (raw && raw.text) || '';
+      const lines = text.split(/\r?\n/);
+      if (lines.length < 2) return [];
+      const header = this._splitCSV(lines[0]).map((x) => x.trim().toLowerCase());
+      const di = header.indexOf('date'), ci = header.indexOf('count');
+      if (di >= 0 && ci >= 0) {
+        const out = [];
+        for (let i = 1; i < lines.length; i++) {
+          if (!lines[i].trim()) continue;
+          const c = this._splitCSV(lines[i]);
+          const d = this._iso(c[di]); const n = parseInt(String(c[ci]).replace(/[^0-9-]/g, ''), 10);
+          if (d && isFinite(n)) out.push({ date: d, count: n });
+        }
+        return out;
+      }
+      const iDate = header.indexOf('date/time'), iId = header.indexOf('trans. id'),
+            iType = header.indexOf('transaction type'), iTotal = header.indexOf('transaction total');
+      if (iDate < 0 || iId < 0 || iType < 0) return [];
+      const completed = new Set(this._completed);
+      const seen = new Set(); const perDay = {};
+      for (let i = 1; i < lines.length; i++) {
+        const ln = lines[i]; if (!ln) continue;
+        const c = this._splitCSV(ln);
+        const id = c[iId]; if (!id || seen.has(id)) continue; seen.add(id);
+        const type = (c[iType] || '').trim().toUpperCase();
+        if (!completed.has(type)) continue;
+        let tot = parseFloat(String(c[iTotal] || '0').replace(/,/g, '')); if (!isFinite(tot)) tot = 0;
+        if (tot < 0) continue;
+        const d = this._iso(c[iDate]); if (!d) continue;
+        perDay[d] = (perDay[d] || 0) + 1;
+      }
+      return Object.keys(perDay).map((d) => ({ date: d, count: perDay[d] }));
+    },
+
+    async status(env, h) {
+      const to = new Date().toISOString().slice(0, 10);
+      const from = new Date(Date.now() - 400 * 86400000).toISOString().slice(0, 10);
+      const r = await h.readIngested(from, to);
+      return { connected: r.daysWithData > 0, org: 'BePoz (report upload)', sandbox: false, lastSync: r.lastDate || null };
+    },
+
+    async fetchRange(env, h, q) {
+      const r = await h.readIngested(q.from, q.to);
+      return { count: Math.round(r.sums.count || 0) };
+    },
+
+    async fetchMonthly(env, h, q) {
+      const m = await h.monthlyIngested(q.fromMonth, q.toMonth);
+      return { months: m.months, count: m.byMonth.map((x) => (x ? Math.round(x.count || 0) : null)) };
+    }
   },
 
   /* >>> ADAPTER 3: ROSTERING (optional - only if the owner has one)
@@ -669,7 +745,7 @@ async function apiIngest(env, request, url) {
     return json({ error: 'no parser', plain: 'This source isn\u2019t set up for file uploads yet. Your AI adds that when this path is chosen.' }, 501);
   }
   const text = await request.text();
-  if (text.length > 2000000) return json({ error: 'too big', plain: 'That file is too large. Export a shorter date range and try again.' }, 413);
+  if (text.length > 8000000) return json({ error: 'too big', plain: 'That file is too large. Export a shorter date range and try again.' }, 413);
   try {
     const rows = await adapter.parseExport(env, makeHelpers(env, source), {
       text, contentType: request.headers.get('Content-Type') || ''
