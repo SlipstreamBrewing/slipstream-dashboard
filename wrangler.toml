@@ -9,6 +9,11 @@ name = "slipstream-dashboard"          # GitHub repo name
 main = "worker.js"
 compatibility_date = "2026-06-01"
 
+# Preserve credentials set in the Cloudflare dashboard across every deploy.
+# Without this, `wrangler deploy` (run on each git push) DELETES dashboard-set
+# secrets - which is what repeatedly wiped the Xero/BePoz/Tanda credentials.
+keep_vars = true
+
 # The dashboard page is bundled into the Worker as text.
 rules = [
   { type = "Text", globs = ["**/*.html"], fallthrough = true }
