@@ -385,7 +385,7 @@ class NotConfigured extends Error {
   constructor(source) { super('not configured: ' + source); this.source = source; }
 }
 
-const BUILD_TAG = 'diag-6';
+const BUILD_TAG = 'diag-7';
 const DIAG_KEY = 'diagk_7c1f9a2b4e55';
 
 const PLAIN_ERRORS = {
