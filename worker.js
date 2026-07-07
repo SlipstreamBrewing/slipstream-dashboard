@@ -331,7 +331,7 @@ class NotConfigured extends Error {
   constructor(source) { super('not configured: ' + source); this.source = source; }
 }
 
-const BUILD_TAG = 'diag-2';
+const BUILD_TAG = 'diag-3';
 const DIAG_KEY = 'diagk_7c1f9a2b4e55';
 
 const PLAIN_ERRORS = {
@@ -774,6 +774,16 @@ async function apiDiag(env, url) {
   if (url.searchParams.get('k') !== DIAG_KEY) return json({ error: 'no' }, 404);
   const out = { build: BUILD_TAG, ts: new Date().toISOString() };
   const h = makeHelpers(env, 'accounting');
+  if (url.searchParams.get('full') === '1') {
+    const u = new URL(url.origin + '/api/metrics?cur=2026-06-01:2026-06-30&prev=2026-05-01:2026-05-31&yoy=2025-06-01:2025-06-30&trend=2025-07:2026-06&tz=Australia/Brisbane&refresh=1');
+    const t0 = Date.now();
+    let st = 0, body = null;
+    try { const resp = await apiMetrics(env, u); st = resp.status; body = await resp.json(); } catch (e) { out.fullThrew = String(e && e.message); }
+    out.fullMs = Date.now() - t0;
+    out.fullStatus = st;
+    if (body) { out.fullSources = body.sources; out.fullCurAcc = !!(body.periods && body.periods.cur && body.periods.cur.accounting); out.fullCurPos = !!(body.periods && body.periods.cur && body.periods.cur.pos); }
+    return json(out);
+  }
   try { const t = await getTokens(env, 'accounting'); out.hasAccTokens = !!(t && t.access_token); out.hasRefresh = !!(t && t.refresh_token); out.tenantCached = !!(t && t.tenantId); out.expiresInMs = (t && t.expires_at) ? (t.expires_at - Date.now()) : null; } catch (e) { out.tokErr = String(e && e.message); }
   let s0 = Date.now();
   try { out.accStatus = await ADAPTERS.accounting.status(env, h); } catch (e) { out.accStatusErr = { m: String(e && e.message), code: e && e.status }; }
