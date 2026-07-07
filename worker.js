@@ -79,22 +79,129 @@ const ADAPTERS = {
      'Demo Company'. Secrets: ACCOUNTING_CLIENT_ID, ACCOUNTING_CLIENT_SECRET.
   */
   accounting: {
-    configured: false,
-    auth: null, /* 'oauth' | 'token' */
+    configured: true,
+    auth: 'oauth',
     oauth: {
-      /* Example (Xero) - fill these when you wire the adapter:
-         authorizeUrl: 'https://login.xero.com/identity/connect/authorize',
-         tokenUrl: 'https://identity.xero.com/connect/token',
-         scopes: 'offline_access accounting.reports.profitandloss.read',
-         clientIdSecret: 'ACCOUNTING_CLIENT_ID',
-         clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
-         tokenAuth: 'basic'   // Xero's token endpoint wants HTTP Basic client auth
-                              // (client_secret_basic). Use 'post' only for providers
-                              // that expect client_id/secret in the form body. */
+      authorizeUrl: 'https://login.xero.com/identity/connect/authorize',
+      tokenUrl: 'https://identity.xero.com/connect/token',
+      scopes: 'offline_access accounting.reports.profitandloss.read',
+      clientIdSecret: 'ACCOUNTING_CLIENT_ID',
+      clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
+      tokenAuth: 'basic'   /* Xero's token endpoint wants HTTP Basic client auth */
     },
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('accounting'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('accounting'); }
+
+    _wageRe: /wages|salaries|superannuation|super|payroll|annual leave|long service|workcover/i,
+
+    _num(v) {
+      if (v == null) return 0;
+      let s = String(v).trim().replace(/,/g, '');
+      let neg = false;
+      if (/^\(.*\)$/.test(s)) { neg = true; s = s.slice(1, -1); }
+      const n = parseFloat(s);
+      if (!isFinite(n)) return 0;
+      return neg ? -n : n;
+    },
+
+    /* Resolve the connected Xero organisation (tenant); cache it in the token store. */
+    async _tenant(env, h) {
+      const tokens = await h.getTokens();
+      if (tokens && tokens.tenantId) return { id: tokens.tenantId, name: tokens.tenantName || null };
+      const conns = await h.fetchJson('https://api.xero.com/connections', { headers: { Accept: 'application/json' } });
+      const list = Array.isArray(conns) ? conns : [];
+      const org = list.find((c) => c.tenantType === 'ORGANISATION') || list[0];
+      if (!org) { const e = new Error('no tenant'); e.status = 401; throw e; }
+      if (tokens) { tokens.tenantId = org.tenantId; tokens.tenantName = org.tenantName; await h.saveTokens(tokens); }
+      return { id: org.tenantId, name: org.tenantName };
+    },
+
+    async _pl(env, h, tenantId, from, to) {
+      const u = 'https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss?fromDate=' + from + '&toDate=' + to;
+      return h.fetchJson(u, { headers: { 'Xero-Tenant-Id': tenantId, Accept: 'application/json' } });
+    },
+
+    /* Walk the P&L: Income (trading only) - Cost of Sales - Operating Expenses,
+       splitting wages+super out of opex (keyword match; owner confirms at reconcile). */
+    _metrics(report) {
+      const num = this._num.bind(this);
+      const rep = report && report.Reports && report.Reports[0];
+      const rows = (rep && rep.Rows) || [];
+      let revenue = 0, cogs = 0, opexTotal = 0, wagesSuper = 0;
+      const wageLines = [];
+      const val = (cells) => (cells && cells.length > 1 ? num(cells[cells.length - 1].Value) : 0);
+      const sectionTotal = (sec) => {
+        const rr = sec.Rows || [];
+        const summ = rr.find((r) => r.RowType === 'SummaryRow');
+        if (summ) return val(summ.Cells);
+        return rr.filter((r) => r.RowType === 'Row').reduce((a, r) => a + val(r.Cells), 0);
+      };
+      for (const sec of rows) {
+        if (sec.RowType !== 'Section') continue;
+        const t = (sec.Title || '').toLowerCase();
+        const isOtherIncome = t.includes('other income');
+        const isCOGS = t.includes('cost of sales') || t.includes('cost of goods');
+        const isIncome = !isCOGS && !isOtherIncome && (t.includes('income') || t.includes('revenue') || t.includes('trading income') || t === 'sales');
+        const isOpex = t.includes('operating expense') || t === 'expenses' || t.includes('overhead');
+        if (isIncome) revenue += sectionTotal(sec);
+        else if (isCOGS) cogs += sectionTotal(sec);
+        else if (isOpex) {
+          opexTotal += sectionTotal(sec);
+          for (const r of (sec.Rows || [])) {
+            if (r.RowType !== 'Row') continue;
+            const label = (r.Cells && r.Cells[0] && r.Cells[0].Value) || '';
+            if (this._wageRe.test(label)) { const v = val(r.Cells); wagesSuper += v; wageLines.push({ label, value: v }); }
+          }
+        }
+      }
+      const overheads = opexTotal - wagesSuper;
+      return { revenue, cogs, wagesSuper, overheads, wageLines };
+    },
+
+    async status(env, h) {
+      const tokens = await h.getTokens();
+      if (!tokens || !tokens.access_token) return { connected: false };
+      const t = await this._tenant(env, h);
+      return {
+        connected: true,
+        org: t.name,
+        sandbox: !!(t.name && /demo company/i.test(t.name)),
+        lastSync: null
+      };
+    },
+
+    async fetchRange(env, h, q) {
+      const t = await this._tenant(env, h);
+      const rep = await this._pl(env, h, t.id, q.from, q.to);
+      const m = this._metrics(rep);
+      return { revenue: m.revenue, cogs: m.cogs, wagesSuper: m.wagesSuper, overheads: m.overheads };
+    },
+
+    async fetchMonthly(env, h, q) {
+      const t = await this._tenant(env, h);
+      const months = [];
+      let [y, mo] = q.fromMonth.split('-').map(Number);
+      const [ey, em] = q.toMonth.split('-').map(Number);
+      while ((y < ey || (y === ey && mo <= em)) && months.length < 24) {
+        months.push([y, mo]); mo++; if (mo > 12) { mo = 1; y++; }
+      }
+      const out = { months: [], revenue: [], cogs: [], wagesSuper: [], overheads: [] };
+      for (const [yy, mm] of months) {
+        const mm2 = String(mm).padStart(2, '0');
+        const from = yy + '-' + mm2 + '-01';
+        const lastDay = new Date(Date.UTC(yy, mm, 0)).getUTCDate();
+        const to = yy + '-' + mm2 + '-' + String(lastDay).padStart(2, '0');
+        out.months.push(yy + '-' + mm2);
+        try {
+          const rep = await this._pl(env, h, t.id, from, to);
+          const m = this._metrics(rep);
+          out.revenue.push(m.revenue); out.cogs.push(m.cogs);
+          out.wagesSuper.push(m.wagesSuper); out.overheads.push(m.overheads);
+        } catch (e) {
+          out.revenue.push(null); out.cogs.push(null);
+          out.wagesSuper.push(null); out.overheads.push(null);
+        }
+      }
+      return out;
+    }
   },
 
   /* >>> ADAPTER 2: POS
