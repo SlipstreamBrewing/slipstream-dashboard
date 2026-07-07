@@ -331,7 +331,7 @@ class NotConfigured extends Error {
   constructor(source) { super('not configured: ' + source); this.source = source; }
 }
 
-const BUILD_TAG = 'diag-4';
+const BUILD_TAG = 'diag-5';
 const DIAG_KEY = 'diagk_7c1f9a2b4e55';
 
 const PLAIN_ERRORS = {
@@ -774,6 +774,7 @@ async function apiDiag(env, url) {
   if (url.searchParams.get('k') !== DIAG_KEY) return json({ error: 'no' }, 404);
   const out = { build: BUILD_TAG, ts: new Date().toISOString() };
   const h = makeHelpers(env, 'accounting');
+  out.env = { accId: (env.ACCOUNTING_CLIENT_ID || '').length, accSecret: (env.ACCOUNTING_CLIENT_SECRET || '').length, ingest: (env.INGEST_TOKEN || '').length };
   if (url.searchParams.get('full') === '1') {
     const u = new URL(url.origin + '/api/metrics?cur=2026-06-01:2026-06-30&prev=2026-05-01:2026-05-31&yoy=2025-06-01:2025-06-30&trend=2025-07:2026-06&tz=Australia/Brisbane&refresh=1');
     const t0 = Date.now();
