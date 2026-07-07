@@ -331,7 +331,7 @@ class NotConfigured extends Error {
   constructor(source) { super('not configured: ' + source); this.source = source; }
 }
 
-const BUILD_TAG = 'diag-3';
+const BUILD_TAG = 'diag-4';
 const DIAG_KEY = 'diagk_7c1f9a2b4e55';
 
 const PLAIN_ERRORS = {
@@ -713,11 +713,13 @@ function eachDate(from, to, cap) {
 
 /* Sum stored day rows across a range. Returns { sums, daysWithData, lastDate }. */
 async function readIngested(env, source, from, to) {
+  const dates = eachDate(from, to);
+  const raws = await Promise.all(dates.map((d) => env.TOKENS.get('data:' + source + ':' + d)));
   const sums = {};
   let daysWithData = 0, lastDate = null;
-  for (const date of eachDate(from, to)) {
-    const raw = await env.TOKENS.get('data:' + source + ':' + date);
-    if (!raw) continue;
+  dates.forEach((date, i) => {
+    const raw = raws[i];
+    if (!raw) return;
     daysWithData++; lastDate = date;
     try {
       const row = JSON.parse(raw);
@@ -725,20 +727,18 @@ async function readIngested(env, source, from, to) {
         if (typeof v === 'number' && isFinite(v)) sums[k] = (sums[k] || 0) + v;
       }
     } catch (e) { /* skip bad row */ }
-  }
+  });
   return { sums, daysWithData, lastDate };
 }
 
 async function monthlyIngested(env, source, fromMonth, toMonth) {
   const months = monthList(fromMonth, toMonth);
-  const out = { months, byMonth: [] };
-  for (const mo of months) {
+  const results = await Promise.all(months.map((mo) => {
     const [y, m] = mo.split('-').map(Number);
     const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
-    const r = await readIngested(env, source, mo + '-01', mo + '-' + String(lastDay).padStart(2, '0'));
-    out.byMonth.push(r.daysWithData ? r.sums : null);
-  }
-  return out;
+    return readIngested(env, source, mo + '-01', mo + '-' + String(lastDay).padStart(2, '0'));
+  }));
+  return { months, byMonth: results.map((r) => (r.daysWithData ? r.sums : null)) };
 }
 
 /* POST /api/ingest?source=pos|accounting|rostering
