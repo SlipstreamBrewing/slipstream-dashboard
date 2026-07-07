@@ -331,7 +331,7 @@ class NotConfigured extends Error {
   constructor(source) { super('not configured: ' + source); this.source = source; }
 }
 
-const BUILD_TAG = 'diag-1';
+const BUILD_TAG = 'diag-2';
 const DIAG_KEY = 'diagk_7c1f9a2b4e55';
 
 const PLAIN_ERRORS = {
@@ -383,34 +383,39 @@ function tokenRequestInit(cfg, params, env) {
 
 /* Returns a valid access token for an OAuth source, refreshing (and
    persisting the ROTATED refresh token) when needed. */
-async function getValidAccessToken(env, source) {
-  const adapter = ADAPTERS[source];
-  const tokens = await getTokens(env, source);
-  if (!tokens || !tokens.access_token) { const e = new Error('no tokens'); e.status = 401; throw e; }
-  const skewMs = 60 * 1000;
-  if (!tokens.expires_at || Date.now() < tokens.expires_at - skewMs) return tokens.access_token;
-
-  /* refresh */
-  const cfg = adapter.oauth || {};
+/* Single-flight refresh: many data calls in one request can hit an expired
+   token at once. Xero refresh tokens are single-use, so concurrent refreshes
+   invalidate each other. Coalesce them onto ONE in-flight promise per source. */
+const _refreshInFlight = {};
+async function refreshAccessToken(env, source, tokens) {
+  const cfg = (ADAPTERS[source] && ADAPTERS[source].oauth) || {};
   if (!tokens.refresh_token || !cfg.tokenUrl) { const e = new Error('cannot refresh'); e.status = 401; throw e; }
   const res = await fetch(cfg.tokenUrl, tokenRequestInit(cfg, {
     grant_type: 'refresh_token',
     refresh_token: tokens.refresh_token
   }, env));
-  if (!res.ok) {
-    /* refresh failed: force a reconnect rather than silently serving stale data */
-    const e = new Error('refresh failed'); e.status = 401; throw e;
-  }
+  if (!res.ok) { const e = new Error('refresh failed'); e.status = 401; throw e; }
   const fresh = await res.json();
   const updated = {
     ...tokens,
     access_token: fresh.access_token,
-    /* CRITICAL: many providers (Xero!) rotate the refresh token - always keep the new one */
+    /* CRITICAL: Xero rotates the refresh token every time - always keep the new one */
     refresh_token: fresh.refresh_token || tokens.refresh_token,
     expires_at: Date.now() + ((fresh.expires_in || 1800) * 1000)
   };
   await saveTokens(env, source, updated);
   return updated.access_token;
+}
+async function getValidAccessToken(env, source) {
+  const tokens = await getTokens(env, source);
+  if (!tokens || !tokens.access_token) { const e = new Error('no tokens'); e.status = 401; throw e; }
+  const skewMs = 60 * 1000;
+  if (!tokens.expires_at || Date.now() < tokens.expires_at - skewMs) return tokens.access_token;
+  if (!_refreshInFlight[source]) {
+    _refreshInFlight[source] = refreshAccessToken(env, source, tokens)
+      .finally(() => { delete _refreshInFlight[source]; });
+  }
+  return _refreshInFlight[source];
 }
 
 /* Helpers handed to every adapter call */
