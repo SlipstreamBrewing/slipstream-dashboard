@@ -184,20 +184,24 @@ const ADAPTERS = {
         months.push([y, mo]); mo++; if (mo > 12) { mo = 1; y++; }
       }
       const out = { months: [], revenue: [], cogs: [], wagesSuper: [], overheads: [] };
-      for (const [yy, mm] of months) {
-        const mm2 = String(mm).padStart(2, '0');
-        const from = yy + '-' + mm2 + '-01';
-        const lastDay = new Date(Date.UTC(yy, mm, 0)).getUTCDate();
-        const to = yy + '-' + mm2 + '-' + String(lastDay).padStart(2, '0');
-        out.months.push(yy + '-' + mm2);
-        try {
-          const rep = await this._pl(env, h, t.id, from, to);
-          const m = this._metrics(rep);
-          out.revenue.push(m.revenue); out.cogs.push(m.cogs);
-          out.wagesSuper.push(m.wagesSuper); out.overheads.push(m.overheads);
-        } catch (e) {
-          out.revenue.push(null); out.cogs.push(null);
-          out.wagesSuper.push(null); out.overheads.push(null);
+      const self = this;
+      const CHUNK = 5; /* keep concurrent Xero calls modest (rate/concurrency safe) */
+      for (let i = 0; i < months.length; i += CHUNK) {
+        const batch = months.slice(i, i + CHUNK);
+        const res = await Promise.all(batch.map(async ([yy, mm]) => {
+          const mm2 = String(mm).padStart(2, '0');
+          const from = yy + '-' + mm2 + '-01';
+          const lastDay = new Date(Date.UTC(yy, mm, 0)).getUTCDate();
+          const to = yy + '-' + mm2 + '-' + String(lastDay).padStart(2, '0');
+          try { const rep = await self._pl(env, h, t.id, from, to); return { mo: yy + '-' + mm2, m: self._metrics(rep) }; }
+          catch (e) { return { mo: yy + '-' + mm2, m: null }; }
+        }));
+        for (const r of res) {
+          out.months.push(r.mo);
+          out.revenue.push(r.m ? r.m.revenue : null);
+          out.cogs.push(r.m ? r.m.cogs : null);
+          out.wagesSuper.push(r.m ? r.m.wagesSuper : null);
+          out.overheads.push(r.m ? r.m.overheads : null);
         }
       }
       return out;
@@ -285,10 +289,8 @@ const ADAPTERS = {
     },
 
     async status(env, h) {
-      const to = new Date().toISOString().slice(0, 10);
-      const from = new Date(Date.now() - 400 * 86400000).toISOString().slice(0, 10);
-      const r = await h.readIngested(from, to);
-      return { connected: r.daysWithData > 0, org: 'BePoz (report upload)', sandbox: false, lastSync: r.lastDate || null };
+      const ls = await h.lastSyncAt();
+      return { connected: !!ls, org: 'BePoz (report upload)', sandbox: false, lastSync: ls || null };
     },
 
     async fetchRange(env, h, q) {
@@ -415,6 +417,7 @@ function makeHelpers(env, source) {
     getTokens: () => getTokens(env, source),
     saveTokens: (t) => saveTokens(env, source, t),
     noteSync: () => noteSync(env, source),
+    lastSyncAt: () => lastSync(env, source),
     saveIngestedRows: (rows) => saveIngestedRows(env, source, rows),
     readIngested: (from, to) => readIngested(env, source, from, to),
     monthlyIngested: (fromMonth, toMonth) => monthlyIngested(env, source, fromMonth, toMonth),
@@ -852,10 +855,12 @@ async function apiMetrics(env, url) {
     if (cached) { try { data = JSON.parse(cached); } catch (e) { data = null; } }
   }
   if (!data) {
-    const periods = {};
-    periods.cur = await fetchSlot(env, { ...base, ...cur });
-    periods.prev = prev ? await fetchSlot(env, { ...base, ...prev }) : null;
-    periods.yoy = yoy ? await fetchSlot(env, { ...base, ...yoy }) : null;
+    const [curSlot, prevSlot, yoySlot] = await Promise.all([
+      fetchSlot(env, { ...base, ...cur }),
+      prev ? fetchSlot(env, { ...base, ...prev }) : Promise.resolve(null),
+      yoy ? fetchSlot(env, { ...base, ...yoy }) : Promise.resolve(null)
+    ]);
+    const periods = { cur: curSlot, prev: prevSlot, yoy: yoySlot };
 
     let trendOut = null;
     if (trend) {
