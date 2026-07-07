@@ -385,9 +385,6 @@ class NotConfigured extends Error {
   constructor(source) { super('not configured: ' + source); this.source = source; }
 }
 
-const BUILD_TAG = 'diag-7';
-const DIAG_KEY = 'diagk_7c1f9a2b4e55';
-
 const PLAIN_ERRORS = {
   401: 'This connection needs reconnecting. Click Reconnect and log in again.',
   403: 'This connection is missing a permission it needs. Your AI will sort out the access.',
@@ -824,40 +821,6 @@ async function apiIngest(env, request, url) {
   }
 }
 
-async function apiDiag(env, url) {
-  if (url.searchParams.get('k') !== DIAG_KEY) return json({ error: 'no' }, 404);
-  const out = { build: BUILD_TAG, ts: new Date().toISOString() };
-  const h = makeHelpers(env, 'accounting');
-  out.env = { accId: (env.ACCOUNTING_CLIENT_ID || '').length, accSecret: (env.ACCOUNTING_CLIENT_SECRET || '').length, ingest: (env.INGEST_TOKEN || '').length, roster: (env.ROSTERING_API_TOKEN || '').length };
-  if (url.searchParams.get('full') === '1') {
-    const u = new URL(url.origin + '/api/metrics?cur=2026-06-01:2026-06-30&prev=2026-05-01:2026-05-31&yoy=2025-06-01:2025-06-30&trend=2025-07:2026-06&tz=Australia/Brisbane&refresh=1');
-    const t0 = Date.now();
-    let st = 0, body = null;
-    try { const resp = await apiMetrics(env, u); st = resp.status; body = await resp.json(); } catch (e) { out.fullThrew = String(e && e.message); }
-    out.fullMs = Date.now() - t0;
-    out.fullStatus = st;
-    if (body) { out.fullSources = body.sources; out.fullCurAcc = !!(body.periods && body.periods.cur && body.periods.cur.accounting); out.fullCurPos = !!(body.periods && body.periods.cur && body.periods.cur.pos); }
-    return json(out);
-  }
-  try { const t = await getTokens(env, 'accounting'); out.hasAccTokens = !!(t && t.access_token); out.hasRefresh = !!(t && t.refresh_token); out.tenantCached = !!(t && t.tenantId); out.expiresInMs = (t && t.expires_at) ? (t.expires_at - Date.now()) : null; } catch (e) { out.tokErr = String(e && e.message); }
-  let s0 = Date.now();
-  try { out.accStatus = await ADAPTERS.accounting.status(env, h); } catch (e) { out.accStatusErr = { m: String(e && e.message), code: e && e.status }; }
-  out.accStatusMs = Date.now() - s0;
-  s0 = Date.now();
-  try { const r = await ADAPTERS.accounting.fetchRange(env, h, { from: '2026-06-01', to: '2026-06-30' }); out.rangeOk = true; out.revenueSeen = typeof r.revenue === 'number'; } catch (e) { out.rangeOk = false; out.rangeErr = { m: String(e && e.message), code: e && e.status }; }
-  out.rangeMs = Date.now() - s0;
-  s0 = Date.now();
-  try { const m = await ADAPTERS.accounting.fetchMonthly(env, h, { fromMonth: '2026-04', toMonth: '2026-06' }); out.monthlyOk = true; out.monthsN = (m.months || []).length; } catch (e) { out.monthlyOk = false; out.monthlyErr = { m: String(e && e.message), code: e && e.status }; }
-  out.monthlyMs = Date.now() - s0;
-  try { out.posLastSync = await lastSync(env, 'pos'); } catch (e) {}
-  const hr = makeHelpers(env, 'rostering');
-  try { out.rosStatus = await ADAPTERS.rostering.status(env, hr); } catch (e) { out.rosStatusErr = { m: String(e && e.message), code: e && e.status }; }
-  let sr = Date.now();
-  try { const rc = await ADAPTERS.rostering.fetchRange(env, hr, { from: '2026-06-23', to: '2026-06-29' }); out.rosCost = rc.cost; } catch (e) { out.rosErr = { m: String(e && e.message), code: e && e.status }; }
-  out.rosMs = Date.now() - sr;
-  return json(out);
-}
-
 /* ---------------- Metrics API ---------------- */
 
 function parseRange(s) {
@@ -1025,7 +988,6 @@ export default {
     const path = url.pathname;
 
     if (path === '/favicon.ico') return new Response(null, { status: 204 });
-    if (path === '/api/diag' && request.method === 'GET') return apiDiag(env, url);
     if (path === '/api/login' && request.method === 'POST') return apiLogin(env, request);
     if (path === '/api/setup' && request.method === 'POST') return apiSetup(env, request);
     if (path === '/api/logout' && request.method === 'POST') return apiLogout();
